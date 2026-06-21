@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>北斗の拳 ～世紀末覇者伝説～</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  font-family: monospace;
+  overflow: hidden;
+}
+#gameContainer {
+  position: relative;
+  image-rendering: pixelated;
+}
+canvas {
+  display: block;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+#ui {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 8px;
+  background: #000;
+  border-bottom: 2px solid #f80;
+  pointer-events: none;
+}
+.ui-label {
+  color: #f80;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.ui-value {
+  color: #fff;
+  font-size: 10px;
+}
+#message {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  text-align: center;
+  pointer-events: none;
+  z-index: 10;
+}
+#controls {
+  margin-top: 8px;
+  color: #555;
+  font-size: 10px;
+  text-align: center;
+  letter-spacing: 1px;
+}
+</style>
+</head>
+<body>
+<div id="gameContainer">
+  <canvas id="game"></canvas>
+  <div id="ui">
+    <div>
+      <div class="ui-label">LIFE</div>
+      <div class="ui-value" id="hpBar">████████████████</div>
+    </div>
+    <div style="text-align:center">
+      <div class="ui-label">SCORE</div>
+      <div class="ui-value" id="scoreVal">000000</div>
+    </div>
+    <div style="text-align:right">
+      <div class="ui-label">STAGE</div>
+      <div class="ui-value" id="stageVal">1</div>
+    </div>
+  </div>
+  <div id="message"></div>
+</div>
+<div id="controls">
+  ← → 移動 | Z 攻撃 | X ジャンプ | C 奥義発動（ゲージ満タン時）
+</div>
+
+<script>
+// ========================
+// NESカラーパレット（簡易版）
+// ========================
+const C = {
+  BLACK:  '#000000',
+  WHITE:  '#ffffff',
+  RED:    '#d03030',
+  ORANGE: '#ff8800',
+  YELLOW: '#ffcc00',
+  GREEN:  '#008800',
+  BLUE:   '#0000cc',
+  LTBLUE: '#6090ff',
+  BROWN:  '#884400',
+  GRAY:   '#888888',
+  DKGRAY: '#333333',
+  SKIN:   '#ffbb88',
+  DKSKIN: '#cc8855',
+  LTGRAY: '#bbbbbb',
+  PURPLE: '#880088',
+  BLOOD:  '#aa0000',
+};
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = 256, H = 200;
+canvas.width = W;
+canvas.height = H;
+
+// スケール
+let scale = 3;
+function resize() {
+  const maxW = window.innerWidth;
+  const maxH = window.innerHeight - 60;
+  scale = Math.max(1, Math.min(Math.floor(maxW / W), Math.floor(maxH / H)));
+  canvas.style.width = (W * scale) + 'px';
+  canvas.style.height = (H * scale) + 'px';
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ========================
+// ゲーム状態
+// ========================
+let state = 'title'; // title, playing, dead, clear, gameover
+let score = 0;
+let stage = 1;
+let frame = 0;
+let flashMsg = '';
+let flashTimer = 0;
+
+// ========================
+// 入力
+// ========================
+const keys = {};
+const prevKeys = {};
+document.addEventListener('keydown', e => { keys[e.key] = true; });
+document.addEventListener('keyup', e => { keys[e.key] = false; });
+function pressed(k) { return keys[k] && !prevKeys[k]; }
+
+// ========================
+// サウンド（Web Audio API チップチューン）
+// ========================
+let audioCtx = null;
+function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+function playNote(freq, type, dur, vol) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.type = type || 'square';
+  osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+  gain.gain.setValueAtTime(vol || 0.15, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+  osc.start();
+  osc.stop(audioCtx.currentTime + dur);
+}
+
+function sfxPunch() {
+  playNote(180, 'square', 0.05, 0.2);
+  setTimeout(() => playNote(140, 'square', 0.05, 0.15), 40);
+}
+function sfxHit() {
+  playNote(120, 'sawtooth', 0.08, 0.2);
+}
+function sfxJump() {
+  const osc = audioCtx?.createOscillator();
+  if (!osc) return;
+  const gain = audioCtx.createGain();
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  osc.type = 'square';
+  osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+  osc.frequency.linearRampToValueAtTime(400, audioCtx.currentTime + 0.15);
+  gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.2);
+  osc.start(); osc.stop(audioCtx.currentTime + 0.2);
+}
+function sfxExplode() {
+  if (!audioCtx) return;
+  const buf = audioCtx.createBuffer(1, audioCtx.sampleRate * 0.3, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+  src.connect(gain); gain.connect(audioCtx.destination);
+  src.start();
+}
+function sfxOugi() {
+  if (!audioCtx) return;
+  [440, 550, 660, 880].forEach((f, i) => {
+    setTimeout(() => playNote(f, 'sawtooth', 0.2, 0.25), i * 80);
+  });
+}
+
+// BGM
+let bgmNodes = [];
+let bgmPlaying = false;
+function startBGM() {
+  if (bgmPlaying || !audioCtx) return;
+  bgmPlaying = true;
+  const melody = [
+    [330,0.15],[330,0.15],[0,0.15],[330,0.15],[0,0.15],[262,0.15],[330,0.15],[0,0.15],
+    [392,0.3],[0,0.3],[196,0.3],[0,0.3]
+  ];
+  let t = audioCtx.currentTime;
+  function loop() {
+    melody.forEach(([f, d]) => {
+      if (f > 0) {
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.connect(g); g.connect(audioCtx.destination);
+        o.type = 'square';
+        o.frequency.value = f;
+        g.gain.setValueAtTime(0.06, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + d * 0.9);
+        o.start(t); o.stop(t + d);
+        bgmNodes.push(o);
+      }
+      t += d;
+    });
+    if (bgmPlaying) setTimeout(loop, (t - audioCtx.currentTime) * 1000 - 100);
+  }
+  loop();
+}
+function stopBGM() {
+  bgmPlaying = false;
+  bgmNodes.forEach(n => { try { n.stop(); } catch(e){} });
+  bgmNodes = [];
+}
+
+// ========================
+// 地面 / 背景
+// ========================
+const GROUND = H - 32;
+
+function drawBG() {
+  // 空
+  ctx.fillStyle = '#110022';
+  ctx.fillRect(0, 0, W, GROUND - 8);
+  // 地平線グロー
+  ctx.fillStyle = '#ff4400';
+  ctx.fillRect(0, GROUND - 12, W, 4);
+  // 廃墟
+  const ruins = [
+    {x:10, w:18, h:40}, {x:50, w:12, h:55}, {x:80, w:20, h:30},
+    {x:140, w:15, h:50}, {x:180, w:22, h:38}, {x:220, w:14, h:48},
+  ];
+  ruins.forEach(r => {
+    ctx.fillStyle = '#1a0a00';
+    ctx.fillRect(r.x, GROUND - r.h - 8, r.w, r.h);
+    // 窓（点灯）
+    if (Math.random() < 0.3) {
+      ctx.fillStyle = '#ffcc00';
+      ctx.fillRect(r.x + 3, GROUND - r.h - 2, 3, 3);
+    }
+  });
+  // 地面
+  for (let x = 0; x < W; x += 4) {
+    ctx.fillStyle = x % 8 === 0 ? '#442200' : '#331100';
+    ctx.fillRect(x, GROUND - 8, 4, 8);
+  }
+  ctx.fillStyle = '#220800';
+  ctx.fillRect(0, GROUND, W, H - GROUND);
+  // パーティクル（星）
+  ctx.fillStyle = '#ffffff';
+  for (let i = 0; i < 20; i++) {
+    const sx = (i * 67 + frame) % W;
+    const sy = (i * 41) % (GROUND - 20);
+    if ((frame + i) % 30 < 20) ctx.fillRect(sx, sy, 1, 1);
+  }
+}
+
+// ========================
+// プレイヤー（ケンシロウ）
+// ========================
+const player = {
+  x: 40, y: GROUND, w: 16, h: 28,
+  vx: 0, vy: 0,
+  hp: 100, maxHp: 100,
+  onGround: false,
+  dir: 1, // 1=右, -1=左
+  state: 'idle', // idle, walk, jump, attack, hurt, dead, ougi
+  attackTimer: 0,
+  hurtTimer: 0,
+  ougiTimer: 0,
+  ougiGauge: 0,
+  maxOugi: 100,
+  invincible: 0,
+  hitbox: null,
+  combo: 0,
+  comboTimer: 0,
+};
+
+function drawKenshiro(p) {
+  const x = Math.floor(p.x);
+  const y = Math.floor(p.y - p.h);
+  const d = p.dir;
+
+  // アニメーション
+  const blink = (p.invincible > 0) && (frame % 4 < 2);
+  if (blink) return;
+
+  // ボディカラー
+  const jacket = '#000044';
+  const pants = '#000033';
+  const skin = C.SKIN;
+  const hair = '#000000';
+  const scar = '#dd3333';
+
+  ctx.save();
+  if (d === -1) {
+    ctx.translate(x + p.w, y);
+    ctx.scale(-1, 1);
+    const ox = 0;
+    drawKenshiroSprite(ox, 0, p.state, p.attackTimer);
+  } else {
+    ctx.translate(x, y);
+    drawKenshiroSprite(0, 0, p.state, p.attackTimer);
+  }
+  ctx.restore();
+}
+
+function drawKenshiroSprite(ox, oy, state, at) {
+  // 脚
+  const legAnim = (state === 'walk') ? Math.sin(frame * 0.4) * 2 : 0;
+  ctx.fillStyle = '#000033';
+  ctx.fillRect(ox+2, oy+18, 5, 10 + Math.floor(legAnim));
+  ctx.fillRect(ox+9, oy+18, 5, 10 - Math.floor(legAnim));
+  // ブーツ
+  ctx.fillStyle = '#221100';
+  ctx.fillRect(ox+1, oy+26, 6, 4);
+  ctx.fillRect(ox+8, oy+26, 6, 4);
+
+  // 胴体
+  ctx.fillStyle = '#000044';
+  ctx.fillRect(ox+1, oy+10, 14, 10);
+  // 傷のライン
+  ctx.fillStyle = '#2222aa';
+  ctx.fillRect(ox+2, oy+11, 12, 1);
+  ctx.fillRect(ox+2, oy+13, 12, 1);
+  ctx.fillRect(ox+2, oy+15, 12, 1);
+
+  // 腕
+  let armL = 0, armR = 0;
+  if (state === 'attack' && at > 6) { armR = -4; }
+  ctx.fillStyle = '#000044';
+  ctx.fillRect(ox-2, oy+10+armL, 4, 8);
+  ctx.fillRect(ox+14, oy+10+armR, 4, 8);
+  // こぶし
+  ctx.fillStyle = C.SKIN;
+  ctx.fillRect(ox-3, oy+17+armL, 4, 4);
+  ctx.fillRect(ox+14, oy+17+armR, 4, 4);
+  // 攻撃エフェクト
+  if (state === 'attack' && at > 4) {
+    ctx.fillStyle = C.YELLOW;
+    ctx.fillRect(ox+16, oy+16, 8, 3);
+    ctx.fillStyle = C.WHITE;
+    ctx.fillRect(ox+20, oy+14, 4, 7);
+  }
+
+  // 頭
+  ctx.fillStyle = C.SKIN;
+  ctx.fillRect(ox+3, oy+2, 10, 10);
+  // 髪
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(ox+3, oy+2, 10, 4);
+  ctx.fillRect(ox+2, oy+3, 2, 3);
+  // 顔の傷（北斗七星）
+  ctx.fillStyle = '#cc2222';
+  ctx.fillRect(ox+6, oy+6, 2, 1);
+  ctx.fillRect(ox+8, oy+5, 1, 1);
+  ctx.fillRect(ox+9, oy+7, 1, 1);
+  // 目
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(ox+5, oy+6, 2, 2);
+  ctx.fillRect(ox+9, oy+6, 2, 2);
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(ox+6, oy+6, 1, 1);
+  ctx.fillRect(ox+10, oy+6, 1, 1);
+
+  // 奥義エフェクト
+  if (state === 'ougi') {
+    ctx.fillStyle = 'rgba(255,200,0,0.5)';
+    ctx.fillRect(ox-8, oy-4, 32, 36);
+  }
+}
+
+// ========================
+// 敵
+// ========================
+class Enemy {
+  constructor(x, type) {
+    this.x = x;
+    this.y = GROUND;
+    this.w = 14;
+    this.h = 24;
+    this.type = type || 0; // 0=雑兵, 1=中ボス, 2=ボス
+    this.hp = [40, 80, 200][this.type];
+    this.maxHp = this.hp;
+    this.vx = 0;
+    this.vy = 0;
+    this.dir = -1;
+    this.state = 'walk';
+    this.attackTimer = 0;
+    this.hurtTimer = 0;
+    this.onGround = true;
+    this.alive = true;
+    this.explodeTimer = 0;
+    this.aiTimer = Math.floor(Math.random() * 60);
+    this.speed = [0.8, 0.6, 0.4][this.type];
+    this.attackRange = [20, 22, 28][this.type];
+    this.attackCooldown = [80, 100, 60][this.type];
+    this.hitFlash = 0;
+  }
+
+  update() {
+    if (!this.alive) {
+      this.explodeTimer++;
+      return;
+    }
+    if (this.hurtTimer > 0) { this.hurtTimer--; return; }
+
+    this.aiTimer++;
+    const dx = player.x - this.x;
+    const dist = Math.abs(dx);
+    this.dir = dx > 0 ? 1 : -1;
+
+    if (this.state === 'attack') {
+      this.attackTimer--;
+      if (this.attackTimer <= 0) this.state = 'walk';
+      return;
+    }
+
+    // 接近して攻撃
+    if (dist < this.attackRange) {
+      if (this.aiTimer % this.attackCooldown === 0) {
+        this.state = 'attack';
+        this.attackTimer = 30;
+        // 攻撃判定
+        if (player.invincible <= 0) {
+          const dmg = [8, 15, 25][this.type];
+          player.hp = Math.max(0, player.hp - dmg);
+          player.hurtTimer = 20;
+          player.invincible = 40;
+          player.vx = -this.dir * 2;
+          sfxHit();
+          if (player.hp <= 0) { player.state = 'dead'; state = 'dead'; }
+        }
+      }
+    } else {
+      this.vx = this.dir * this.speed;
+    }
+
+    this.x += this.vx;
+    this.vx *= 0.8;
+    this.x = Math.max(0, Math.min(W - this.w, this.x));
+    if (this.hitFlash > 0) this.hitFlash--;
+  }
+
+  draw() {
+    const x = Math.floor(this.x);
+    const y = Math.floor(this.y - this.h);
+    if (!this.alive) {
+      if (this.explodeTimer < 30) {
+        const t = this.explodeTimer;
+        ctx.fillStyle = `rgba(255,${Math.max(0,200-t*6)},0,${1-t/30})`;
+        ctx.fillRect(x - t, y - t, this.w + t*2, this.h + t*2);
+        // 破片
+        for (let i = 0; i < 6; i++) {
+          const a = (i / 6) * Math.PI * 2 + t * 0.2;
+          const r = t * 2;
+          ctx.fillStyle = C.BLOOD;
+          ctx.fillRect(x + this.w/2 + Math.cos(a)*r, y + this.h/2 + Math.sin(a)*r, 2, 2);
+        }
+      }
+      return;
+    }
+    const flash = this.hitFlash > 0;
+    const colors = {
+      body: [C.BROWN, '#442200', '#110011'][this.type],
+      head: [C.SKIN, C.DKSKIN, '#ffaa44'][this.type],
+      hair: ['#ff6600', '#440044', '#ff0000'][this.type],
+    };
+    if (flash) {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(x, y, this.w, this.h);
+      return;
+    }
+    // 体
+    ctx.fillStyle = colors.body;
+    ctx.fillRect(x+1, y+8, 12, 10);
+    // 腕
+    ctx.fillRect(x-2, y+9, 4, 7);
+    ctx.fillRect(x+12, y+9, 4, 7);
+    // 脚
+    ctx.fillStyle = '#222222';
+    ctx.fillRect(x+2, y+17, 4, 7);
+    ctx.fillRect(x+8, y+17, 4, 7);
+    // 頭
+    ctx.fillStyle = colors.head;
+    ctx.fillRect(x+2, y+0, 10, 9);
+    // モヒカン or 特徴
+    ctx.fillStyle = colors.hair;
+    if (this.type === 0) {
+      ctx.fillRect(x+5, y-3, 4, 4); // モヒカン
+    } else if (this.type === 1) {
+      ctx.fillRect(x+2, y-2, 10, 3); // ヘルメット風
+    } else {
+      ctx.fillRect(x+2, y-4, 10, 5); // 大きな冠
+      ctx.fillStyle = '#ffcc00';
+      ctx.fillRect(x+4, y-2, 6, 2);
+    }
+    // 目（敵対的）
+    ctx.fillStyle = '#ff0000';
+    ctx.fillRect(x+3, y+3, 2, 2);
+    ctx.fillRect(x+9, y+3, 2, 2);
+    // HPバー（ボスのみ）
+    if (this.type === 2) {
+      ctx.fillStyle = '#440000';
+      ctx.fillRect(x-4, y-8, this.w+8, 4);
+      ctx.fillStyle = '#ff0000';
+      ctx.fillRect(x-4, y-8, Math.floor((this.w+8) * this.hp / this.maxHp), 4);
+    }
+    // 攻撃エフェクト
+    if (this.state === 'attack' && this.attackTimer > 15) {
+      ctx.fillStyle = C.ORANGE;
+      ctx.fillRect(x + (this.dir > 0 ? this.w : -8), y+8, 8, 4);
+    }
+  }
+
+  hit(dmg) {
+    this.hp -= dmg;
+    this.hitFlash = 6;
+    this.vx = (player.dir) * 3;
+    this.hurtTimer = 10;
+    if (this.hp <= 0) {
+      this.alive = false;
+      this.explodeTimer = 0;
+      score += [100, 300, 1000][this.type];
+      sfxExplode();
+      showFlash(this.type === 2 ? 'ボスを倒した！' : 'ひでぶ！', 60);
+    } else {
+      sfxHit();
+    }
+  }
+}
+
+// ========================
+// パーティクル・エフェクト
+// ========================
+const particles = [];
+
+function addParticles(x, y, n, col) {
+  for (let i = 0; i < n; i++) {
+    particles.push({
+      x, y,
+      vx: (Math.random()-0.5)*4,
+      vy: -Math.random()*4 - 1,
+      life: 20 + Math.floor(Math.random()*20),
+      col: col || C.YELLOW,
+    });
+  }
+}
+
+function updateParticles() {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 0.3;
+    p.life--;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+function drawParticles() {
+  particles.forEach(p => {
+    ctx.fillStyle = p.col;
+    ctx.globalAlpha = p.life / 40;
+    ctx.fillRect(Math.floor(p.x), Math.floor(p.y), 2, 2);
+  });
+  ctx.globalAlpha = 1;
+}
+
+// ========================
+// ステージ管理
+// ========================
+let enemies = [];
+let waveTimer = 0;
+let waveCount = 0;
+const wavesPerStage = 3;
+
+function spawnWave() {
+  waveCount++;
+  const type = waveCount >= wavesPerStage ? (stage >= 3 ? 2 : 1) : 0;
+  const count = type === 2 ? 1 : (type === 1 ? 2 : 3);
+  for (let i = 0; i < count; i++) {
+    const x = W - 20 - i * 20;
+    enemies.push(new Enemy(x, type));
+  }
+  if (type === 2) showFlash('ボス登場！！', 90);
+}
+
+function checkWave() {
+  const living = enemies.filter(e => e.alive);
+  if (living.length === 0 && enemies.every(e => e.explodeTimer > 25)) {
+    if (waveCount >= wavesPerStage) {
+      // ステージクリア
+      if (stage >= 3) {
+        state = 'clear';
+        stopBGM();
+        showFlash('伝説の覇者！！！', 180);
+      } else {
+        stage++;
+        waveCount = 0;
+        enemies = [];
+        player.hp = Math.min(player.maxHp, player.hp + 30);
+        document.getElementById('stageVal').textContent = stage;
+        showFlash(`STAGE ${stage}`, 90);
+        spawnWave();
+      }
+    } else {
+      enemies = [];
+      spawnWave();
+    }
+  }
+}
+
+// ========================
+// フラッシュメッセージ
+// ========================
+function showFlash(msg, dur) {
+  flashMsg = msg;
+  flashTimer = dur;
+}
+
+function drawFlash() {
+  if (flashTimer <= 0) return;
+  flashTimer--;
+  const alpha = Math.min(1, flashTimer / 20);
+  const msgEl = document.getElementById('message');
+  msgEl.innerHTML = `<span style="color:#ffcc00;font-size:${16*scale}px;text-shadow:2px 2px 0 #000,0 0 10px #ff8800;font-family:monospace;font-weight:bold;opacity:${alpha}">${flashMsg}</span>`;
+  if (flashTimer === 0) msgEl.innerHTML = '';
+}
+
+// ========================
+// UI更新
+// ========================
+function updateUI() {
+  // HPバー
+  const hpFrac = player.hp / player.maxHp;
+  const bars = Math.round(hpFrac * 16);
+  const col = hpFrac > 0.5 ? '#00ff44' : hpFrac > 0.25 ? '#ffcc00' : '#ff2200';
+  document.getElementById('hpBar').innerHTML =
+    `<span style="color:${col}">${'█'.repeat(bars)}${'░'.repeat(16-bars)}</span>`;
+  document.getElementById('scoreVal').textContent = String(score).padStart(6, '0');
+
+  // 奥義ゲージ
+  const ougiEl = document.getElementById('ui');
+  // (already rendered inline with canvas)
+}
+
+// ========================
+// タイトル画面
+// ========================
+function drawTitle() {
+  ctx.fillStyle = '#110022';
+  ctx.fillRect(0, 0, W, H);
+  // 星
+  for (let i = 0; i < 30; i++) {
+    ctx.fillStyle = '#ffffff';
+    if ((frame + i * 7) % 20 < 15)
+      ctx.fillRect((i * 83 + frame * 0.5) % W, (i * 47) % (H - 40), 1, 1);
+  }
+
+  // タイトル
+  drawPixelText('北斗の拳', W/2 - 48, 30, '#ff4400', 2);
+  drawPixelText('世紀末覇者伝説', W/2 - 62, 52, '#ffcc00', 1.5);
+  drawPixelText('HOKUTO NO KEN', W/2 - 52, 70, '#ffffff', 1);
+
+  // ケンシロウ（大きめ）
+  ctx.save();
+  ctx.translate(W/2 - 8, 140);
+  drawKenshiroSprite(0, 0, frame % 120 < 60 ? 'idle' : 'walk', 0);
+  ctx.restore();
+
+  if (frame % 40 < 30) drawPixelText('PUSH Z KEY TO START', W/2 - 72, H - 30, '#ffffff', 1);
+  drawPixelText('(C) 2026 TITANS GAMES', W/2 - 80, H - 16, '#444444', 1);
+}
+
+// ========================
+// ゲームオーバー / クリア
+// ========================
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0, 0, W, H);
+  drawPixelText('GAME OVER', W/2 - 40, H/2 - 20, '#ff2200', 2);
+  drawPixelText(`SCORE: ${score}`, W/2 - 36, H/2 + 10, '#ffcc00', 1.5);
+  if (frame % 40 < 30) drawPixelText('PUSH Z TO RETRY', W/2 - 56, H/2 + 30, '#ffffff', 1);
+}
+
+function drawClear() {
+  ctx.fillStyle = 'rgba(0,0,30,0.8)';
+  ctx.fillRect(0, 0, W, H);
+  drawPixelText('お前はもう', W/2 - 44, H/2 - 40, '#ffcc00', 2);
+  drawPixelText('死んでいる', W/2 - 44, H/2 - 20, '#ff4400', 2);
+  drawPixelText('COMPLETE!', W/2 - 36, H/2 + 10, '#ffffff', 2);
+  drawPixelText(`FINAL SCORE: ${score}`, W/2 - 60, H/2 + 35, '#ffcc00', 1.5);
+  if (frame % 40 < 30) drawPixelText('PUSH Z TO REPLAY', W/2 - 60, H/2 + 55, '#ffffff', 1);
+}
+
+// ========================
+// ピクセルテキスト描画（簡易）
+// ========================
+function drawPixelText(text, x, y, color, size) {
+  ctx.fillStyle = color;
+  ctx.font = `${Math.floor(8 * (size||1))}px monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillText(text, x, y);
+  ctx.textAlign = 'left';
+}
+
+// ========================
+// 初期化
+// ========================
+function initGame() {
+  player.x = 40; player.y = GROUND;
+  player.hp = 100; player.vx = 0; player.vy = 0;
+  player.state = 'idle'; player.attackTimer = 0;
+  player.hurtTimer = 0; player.invincible = 0;
+  player.ougiGauge = 0; player.combo = 0;
+  player.dir = 1;
+  enemies.length = 0;
+  particles.length = 0;
+  score = 0; stage = 1; waveCount = 0;
+  document.getElementById('stageVal').textContent = '1';
+  showFlash('STAGE 1', 90);
+  spawnWave();
+  startBGM();
+}
+
+// ========================
+// メインループ
+// ========================
+function update() {
+  frame++;
+
+  // 奥義ゲージ装飾（canvas外）
+  const gaugeEl = document.getElementById('ui');
+
+  if (state === 'title') {
+    if (pressed('z') || pressed('Z')) {
+      initAudio();
+      state = 'playing';
+      initGame();
+    }
+    return;
+  }
+
+  if (state === 'dead' || state === 'gameover') {
+    if (pressed('z') || pressed('Z')) {
+      state = 'playing';
+      stopBGM();
+      initGame();
+    }
+    return;
+  }
+
+  if (state === 'clear') {
+    if (pressed('z') || pressed('Z')) {
+      state = 'playing';
+      stopBGM();
+      initGame();
+    }
+    return;
+  }
+
+  // ========================
+  // プレイヤー更新
+  // ========================
+  const p = player;
+
+  if (p.hurtTimer > 0) p.hurtTimer--;
+  if (p.invincible > 0) p.invincible--;
+  if (p.comboTimer > 0) { p.comboTimer--; if (p.comboTimer === 0) p.combo = 0; }
+
+  if (p.state !== 'dead' && p.state !== 'ougi') {
+    // 移動
+    if ((keys['ArrowLeft'] || keys['a']) && p.hurtTimer === 0) {
+      p.vx = -2.5;
+      p.dir = -1;
+      if (p.onGround) p.state = 'walk';
+    } else if ((keys['ArrowRight'] || keys['d']) && p.hurtTimer === 0) {
+      p.vx = 2.5;
+      p.dir = 1;
+      if (p.onGround) p.state = 'walk';
+    } else {
+      p.vx *= 0.7;
+      if (p.onGround && p.state !== 'attack') p.state = 'idle';
+    }
+
+    // ジャンプ
+    if ((pressed('x') || pressed('X') || pressed('ArrowUp')) && p.onGround) {
+      p.vy = -7;
+      p.onGround = false;
+      p.state = 'jump';
+      sfxJump();
+    }
+
+    // 攻撃
+    if ((pressed('z') || pressed('Z')) && p.hurtTimer === 0) {
+      if (p.attackTimer === 0) {
+        p.state = 'attack';
+        p.attackTimer = 14;
+        p.combo++;
+        p.comboTimer = 40;
+        sfxPunch();
+        // ヒット判定
+        const ax = p.x + (p.dir > 0 ? p.w : -20);
+        const aw = 20;
+        enemies.forEach(e => {
+          if (!e.alive) return;
+          if (e.x < ax + aw && e.x + e.w > ax && e.y > p.y - p.h - 10 && e.y < p.y + 10) {
+            const dmg = 10 + p.combo * 3;
+            e.hit(dmg);
+            p.ougiGauge = Math.min(p.maxOugi, p.ougiGauge + 15);
+            addParticles(e.x + e.w/2, e.y - e.h/2, 8, C.YELLOW);
+          }
+        });
+      }
+    }
+
+    // 奥義
+    if ((pressed('c') || pressed('C')) && p.ougiGauge >= p.maxOugi) {
+      p.state = 'ougi';
+      p.ougiTimer = 60;
+      p.ougiGauge = 0;
+      sfxOugi();
+      showFlash('北斗百裂拳！！', 90);
+    }
+  }
+
+  // 奥義発動中
+  if (p.state === 'ougi') {
+    p.ougiTimer--;
+    if (p.ougiTimer <= 0) p.state = 'idle';
+    else if (p.ougiTimer % 6 === 0) {
+      // 全体ダメージ
+      enemies.forEach(e => {
+        if (e.alive) {
+          e.hit(30);
+          addParticles(e.x + e.w/2, e.y - e.h/2, 12, C.ORANGE);
+        }
+      });
+    }
+  }
+
+  // 攻撃クールダウン
+  if (p.attackTimer > 0) {
+    p.attackTimer--;
+    if (p.attackTimer === 0 && p.state === 'attack') p.state = 'idle';
+  }
+
+  // 重力
+  p.vy += 0.5;
+  p.y += p.vy;
+  p.x += p.vx;
+
+  // 地面
+  if (p.y >= GROUND) {
+    p.y = GROUND;
+    p.vy = 0;
+    p.onGround = true;
+    if (p.state === 'jump') p.state = 'idle';
+  } else {
+    p.onGround = false;
+  }
+
+  // 画面端
+  p.x = Math.max(0, Math.min(W - p.w, p.x));
+
+  // 敵更新
+  enemies.forEach(e => e.update());
+
+  // ウェーブチェック
+  checkWave();
+
+  // パーティクル
+  updateParticles();
+
+  updateUI();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+
+  if (state === 'title') {
+    drawTitle();
+    return;
+  }
+
+  drawBG();
+  drawParticles();
+  enemies.forEach(e => e.draw());
+  drawKenshiro(player);
+
+  // 奥義ゲージ
+  const gx = 4, gy = H - 14;
+  ctx.fillStyle = '#220000';
+  ctx.fillRect(gx, gy, 60, 6);
+  ctx.fillStyle = player.ougiGauge >= player.maxOugi ? '#ffcc00' : '#ff4400';
+  ctx.fillRect(gx, gy, Math.floor(60 * player.ougiGauge / player.maxOugi), 6);
+  ctx.fillStyle = '#888';
+  ctx.font = '6px monospace';
+  ctx.fillText('OUGI', gx, gy - 2);
+
+  // コンボ
+  if (player.combo >= 2) {
+    ctx.fillStyle = C.YELLOW;
+    ctx.font = '8px monospace';
+    ctx.fillText(`${player.combo} HIT!`, player.x, player.y - player.h - 12);
+  }
+
+  if (state === 'dead' || state === 'gameover') drawGameOver();
+  if (state === 'clear') drawClear();
+
+  drawFlash();
+}
+
+function loop() {
+  update();
+  draw();
+  Object.assign(prevKeys, keys);
+  requestAnimationFrame(loop);
+}
+
+// タイトルで開始
+document.getElementById('message').innerHTML = '';
+loop();
+
+// タッチ操作（モバイル）
+let touchStartX = 0;
+canvas.addEventListener('touchstart', e => {
+  initAudio();
+  touchStartX = e.touches[0].clientX;
+  // タップ攻撃
+  keys['z'] = true;
+  setTimeout(() => keys['z'] = false, 50);
+}, {passive:true});
+canvas.addEventListener('touchmove', e => {
+  const dx = e.touches[0].clientX - touchStartX;
+  if (Math.abs(dx) > 10) {
+    keys['ArrowLeft'] = dx < 0;
+    keys['ArrowRight'] = dx > 0;
+  }
+  e.preventDefault();
+}, {passive:false});
+canvas.addEventListener('touchend', e => {
+  keys['ArrowLeft'] = false;
+  keys['ArrowRight'] = false;
+}, {passive:true});
+</script>
+</body>
+</html>
